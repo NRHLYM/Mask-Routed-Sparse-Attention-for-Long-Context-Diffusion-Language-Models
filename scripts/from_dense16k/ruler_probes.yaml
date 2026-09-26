@@ -1,0 +1,33 @@
+# Table-2 RULER probes for Dream 16k-trained sparse baselines.
+# Packed with NVIDIA RULER (Dream tokenizer, noise haystack) so length is exact.
+# Needle structure matches train_fulltext RulerDenoisingSynthesizer task 0/1/2
+# and HiLS-Attn (S-N / MK-MQ 6 KV + 2 queries / VT 6 vars, 2 hops).
+#
+# Do not use stock niah_multiquery (1 key, 4 queries) or stock vt (1 chain, 4 hops).
+
+hils_sn:
+  task: niah
+  args:
+    type_haystack: noise
+    type_needle_k: words
+    type_needle_v: numbers
+    num_needle_k: 1
+    num_needle_v: 1
+    num_needle_q: 1
+
+hils_mkmq:
+  task: niah
+  args:
+    type_haystack: noise
+    type_needle_k: words
+    type_needle_v: numbers
+    num_needle_k: 6
+    num_needle_v: 1
+    num_needle_q: 2
+
+hils_vt:
+  task: variable_tracking
+  args:
+    type_haystack: noise
+    num_chains: 2
+    num_hops: 2
