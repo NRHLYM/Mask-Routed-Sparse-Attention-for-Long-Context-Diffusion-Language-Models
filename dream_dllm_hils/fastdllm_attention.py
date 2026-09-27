@@ -12,6 +12,7 @@ from dream_dllm_hils.attention import (
 )
 from dream_dllm_hils.fastdllm_cache import LayerKVCache
 from dream_dllm_hils.dsa_attention import DreamDsaAttention
+from dream_dllm_hils.nsa_attention import DreamNsaAttention
 from dream_dllm_hils.kernel_utils import remote_drop_mask
 from dream_dllm_hils.local_attention import cached_local_attention
 from dream_dllm_hils.routing import (
@@ -68,7 +69,7 @@ def _rows_for_positions(
 @torch.inference_mode()
 def cached_attention_forward(
     attention: KernelDreamSlidingWindowAttention
-    | KernelDreamFullHiLSAttention | DreamDsaAttention,
+    | KernelDreamFullHiLSAttention | DreamDsaAttention | DreamNsaAttention,
     hidden_states: torch.Tensor,
     *,
     position_ids: torch.Tensor | None,
@@ -117,6 +118,43 @@ def cached_attention_forward(
         upper_bound=chunk_count,
         device=hidden_states.device,
     )
+
+    if isinstance(attention, DreamNsaAttention):
+        q_rope, q_raw, k_rope, k_raw, partial_v = attention._project_qkv_nsa(
+            hidden_states,
+            position_ids,
+            position_embeddings,
+        )
+        cache.replace(
+            kv_update_positions,
+            k_rope.index_select(1, update_rows),
+            partial_v.index_select(1, update_rows),
+        )
+        if cache.nsa_raw_key is None:
+            raise ValueError("NSA cache is missing non-RoPE keys")
+        cache.nsa_raw_key.index_copy_(
+            1,
+            kv_update_positions,
+            k_raw.index_select(1, update_rows),
+        )
+        if affected_chunks.numel():
+            raise ValueError("NSA layers do not cache landmark summaries")
+        output = attention._nsa_output(
+            hidden_states,
+            q_rope,
+            q_raw,
+            cache.key,
+            cache.nsa_raw_key,
+            cache.value,
+            cache.key_valid,
+            allowed=None,
+            query_positions=query_positions,
+        ).reshape(1, query_len, attention.hidden_size)
+        return attention.o_proj(output), CachedAttentionStats(
+            updated_positions=kv_update_positions.clone(),
+            refreshed_chunks=affected_chunks.clone(),
+            routing_calls=1,
+        )
 
     q, partial_k, partial_v = attention._project_qkv_blhd(
         hidden_states,

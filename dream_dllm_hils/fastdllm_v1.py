@@ -12,6 +12,7 @@ from dream_dllm_hils.attention import (
     KernelDreamSlidingWindowAttention,
 )
 from dream_dllm_hils.dsa_attention import DreamDsaAttention
+from dream_dllm_hils.nsa_attention import DreamNsaAttention
 from dream_dllm_hils.fastdllm_cache import HiLSModelCache
 from dream_dllm_hils.longbench_eval import FastDLLMBlockLayout
 
@@ -276,7 +277,7 @@ class DreamHiLSFastDLLM:
             isinstance(
                 module,
                 (KernelDreamSlidingWindowAttention, KernelDreamFullHiLSAttention,
-                 DreamDsaAttention),
+                 DreamDsaAttention, DreamNsaAttention),
             )
             for module in modules
         )
@@ -285,7 +286,7 @@ class DreamHiLSFastDLLM:
             for module in modules
         )
         if not kernel_ok and not dense_ok:
-            raise TypeError("all Dream layers must use HiLS, DSA, sliding, or dense attention")
+            raise TypeError("all Dream layers must use HiLS, DSA, NSA, sliding, or dense attention")
         if dense_ok and self.use_cache:
             raise TypeError("dense Fast-dLLM decoding requires use_cache=False")
         return modules

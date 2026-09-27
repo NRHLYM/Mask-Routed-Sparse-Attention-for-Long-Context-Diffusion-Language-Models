@@ -49,6 +49,7 @@ from dream_dllm_hils.dsa_attention import (
     prepare_dsa_index_losses,
     set_dsa_official_stage,
 )
+from dream_dllm_hils.nsa_attention import install_dream_nsa_attention
 from dream_dllm_hils.checkpointing import (
     capture_rng_state,
     load_trainable_checkpoint,
@@ -192,6 +193,11 @@ DEFAULTS: dict[str, object] = {
     "dsa_warmup_indexer_lr": 0.001,
     "dsa_sparse_aux_scope": "selected",
     "dsa_sparse_aux_queries": 0,
+    "nsa_block_count": 32,
+    "nsa_compress_block": 32,
+    "nsa_compress_stride": 16,
+    "nsa_select_block": 64,
+    "nsa_backend": "tilelang",
     "lmk_token_mode": "mask",
     "ruler_mix_ratio": 0.0,
     "ruler_answer_ce_weight": 1.0,
@@ -265,7 +271,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir")
     parser.add_argument("--resume_from")
     parser.add_argument("--initialize_from")
-    parser.add_argument("--attention_mode", choices=("hils", "dsa", "dense"))
+    parser.add_argument("--attention_mode", choices=("hils", "dsa", "nsa", "dense"))
     parser.add_argument(
         "--non_hils_attention", choices=("sliding", "dense")
     )
@@ -609,6 +615,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow_kernel_fallback", dest="no_kernel_fallback", action="store_false"
     )
+    parser.add_argument("--nsa_block_count", type=int)
+    parser.add_argument("--nsa_compress_block", type=int)
+    parser.add_argument("--nsa_compress_stride", type=int)
+    parser.add_argument("--nsa_select_block", type=int)
+    parser.add_argument("--nsa_backend", choices=("tilelang",))
     parser.add_argument("--dsa_topk", type=int)
     parser.add_argument("--dsa_index_heads", type=int)
     parser.add_argument("--dsa_index_head_dim", type=int)
@@ -1117,7 +1128,7 @@ def validate_training_config(config: dict[str, object]) -> None:
         # trainables, optimizer, scheduler, and RNG from the checkpoint.
         pass
     attention_mode = str(config.get("attention_mode", "hils"))
-    if attention_mode not in {"hils", "dsa", "dense"}:
+    if attention_mode not in {"hils", "dsa", "nsa", "dense"}:
         raise ValueError(f"unsupported attention_mode={attention_mode}")
     non_hils_attention = str(config.get("non_hils_attention", "sliding"))
     if non_hils_attention not in {"sliding", "dense"}:
@@ -1265,6 +1276,23 @@ def validate_training_config(config: dict[str, object]) -> None:
             raise ValueError(
                 "DSA training requires a non-zero LM or auxiliary loss weight"
             )
+    elif attention_mode == "nsa":
+        if str(config.get("nsa_backend", "tilelang")) != "tilelang":
+            raise ValueError("Dream NSA production backend requires TileLang")
+        block_count = int(config.get("nsa_block_count", 32))
+        compress_block = int(config.get("nsa_compress_block", 32))
+        compress_stride = int(config.get("nsa_compress_stride", 16))
+        select_block = int(config.get("nsa_select_block", chunk_size))
+        if block_count <= 0 or block_count > max_length // select_block:
+            raise ValueError("nsa_block_count must fit the selected-block sequence")
+        if compress_block <= 0 or compress_stride <= 0 or compress_stride > compress_block:
+            raise ValueError("NSA compression block/stride are invalid")
+        if select_block <= 0 or max_length % select_block:
+            raise ValueError("nsa_select_block must tile max_length")
+        if (max_length - compress_block) % compress_stride:
+            raise ValueError("NSA compression windows must tile max_length")
+        if chunk_size < 2:
+            raise ValueError("Dream NSA requires chunk_size >= 2")
     elif chunk_size < 2:
         raise ValueError("dense control still requires chunk_size >= 2")
     if int(config["gradient_accumulation_steps"]) <= 0:
@@ -1493,6 +1521,16 @@ def _training_resume_contract(args: argparse.Namespace) -> dict[str, object]:
             "full_dense_teacher_version": "same-forward-qk-qcal-only-kl-v1",
             "model_rope_scaling": args.model_rope_scaling,
         }
+    if args.attention_mode == "nsa":
+        return {
+            "attention_mode": "nsa",
+            "nsa_block_count": int(args.nsa_block_count),
+            "nsa_compress_block": int(getattr(args, "nsa_compress_block", 32)),
+            "nsa_compress_stride": int(getattr(args, "nsa_compress_stride", 16)),
+            "nsa_select_block": int(getattr(args, "nsa_select_block", args.chunk_size)),
+            "nsa_block_size": int(getattr(args, "nsa_select_block", args.chunk_size)),
+            "nsa_backend": "tilelang",
+        }
     if args.attention_mode != "dsa":
         if bool(getattr(args, "hils_sync_ruler_ce", False)) or bool(
             getattr(args, "sync_ruler_all_tasks", False)
@@ -1600,6 +1638,32 @@ def configure_training_attention(
             dsa_layers=list(dsa_plan.dsa_layers),
             sliding_window_layers=list(dsa_plan.sliding_window_layers),
             dense_layers=list(dsa_plan.dense_layers),
+        )
+
+    if args.attention_mode == "nsa":
+        nsa_plan = install_dream_nsa_attention(
+            model,
+            interleave=args.hils_interleave,
+            local_window=args.local_window,
+            swa_local_window=resolved_swa_local_window(args),
+            chunk_size=args.chunk_size,
+            block_count=args.nsa_block_count,
+            non_nsa_attention=args.non_hils_attention,
+            compress_block=getattr(args, "nsa_compress_block", 32),
+            compress_stride=getattr(args, "nsa_compress_stride", 16),
+            select_block=getattr(args, "nsa_select_block", args.chunk_size),
+            skip_inert_slots=False,
+        )
+        for layer_idx in nsa_plan.dense_layers:
+            layer = model.model.layers[layer_idx]
+            layer.self_attn = DenseDreamAttentionAdapter(layer.self_attn)
+        model.config.training_attention_mode = "nsa"
+        return TrainingAttentionPlan(
+            mode="nsa",
+            hils_layers=[],
+            dsa_layers=[],
+            sliding_window_layers=list(nsa_plan.sliding_window_layers),
+            dense_layers=list(nsa_plan.dense_layers),
         )
 
     sparse_plan = install_dream_sparse_attention(
